@@ -202,6 +202,8 @@ export class LocalAgentManager {
     if (current.isErr()) return current;
     const active = this.activeTurns.get(agentId);
     if (!active) return current;
+    const driver = this.driverResult(current.value.provider, "stop", agentId);
+    if (driver.isErr()) return Result.err(driver.error);
 
     active.controller.abort();
     const interrupted = await this.pool.interrupt(agentId);
@@ -209,7 +211,7 @@ export class LocalAgentManager {
     if (interrupted.value === "unsupported") {
       return Result.err(new AgentProviderUnavailableError({
         code: "PROVIDER_UNAVAILABLE",
-        provider: current.value.provider,
+        provider: driver.value.provider,
         agentId,
         operation: "stop",
         retryable: false,
@@ -361,7 +363,7 @@ export class LocalAgentManager {
         },
       };
       const result = signal?.aborted
-        ? Result.err(cancelledAgentRun(record))
+        ? Result.err(cancelledAgentRun(record, driver.value.provider))
         : await this.pool.run(driver.value, context, input.value, callbacks, signal);
       if (result.isErr()) {
         this.persistRunError(record, result.error, startedAt);
@@ -624,10 +626,10 @@ export function createLocalAgentManager(options: LocalAgentManagerOptions): Loca
   return new LocalAgentManager(options);
 }
 
-function cancelledAgentRun(record: LocalAgentRecord): AgentProviderCancelledError {
+function cancelledAgentRun(record: LocalAgentRecord, provider: LocalAgentProvider): AgentProviderCancelledError {
   return new AgentProviderCancelledError({
     code: "PROVIDER_CANCELLED",
-    provider: record.provider,
+    provider,
     agentId: record.id,
     operation: "run",
     retryable: false,
