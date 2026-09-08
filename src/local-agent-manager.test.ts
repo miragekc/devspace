@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { LocalAgentManager } from "./local-agent-manager.js";
 import {
+  AgentProviderCancelledError,
   AgentProviderExecutionError,
   type AgentProviderError,
 } from "./local-agent-errors.js";
@@ -51,6 +52,7 @@ class FakeRuntime implements LocalAgentRuntime {
   readonly inputs: LocalAgentRunInput[] = [];
   closed = false;
   private releaseHold: (() => void) | undefined;
+  private interrupted = false;
 
   async run(
     input: LocalAgentRunInput,
@@ -65,6 +67,15 @@ class FakeRuntime implements LocalAgentRuntime {
     if (input.prompt.includes("fail")) return Result.err(providerFailure("provider failed"));
     if (input.prompt.includes("hold")) {
       await new Promise<void>((resolve) => { this.releaseHold = resolve; });
+      if (this.interrupted) {
+        return Result.err(new AgentProviderCancelledError({
+          code: "PROVIDER_CANCELLED",
+          provider: this.provider,
+          operation: "run",
+          retryable: false,
+          message: "provider turn interrupted",
+        }));
+      }
     }
     return Result.ok({
       provider: this.provider,
@@ -72,6 +83,12 @@ class FakeRuntime implements LocalAgentRuntime {
       finalResponse: `response:${input.prompt}`,
       items: [],
     });
+  }
+
+  async interrupt(): Promise<BetterResult<boolean, AgentProviderError>> {
+    this.interrupted = true;
+    this.release();
+    return Result.ok(true);
   }
 
   release(): void {
@@ -263,6 +280,27 @@ const second = unwrap(await manager.start({
 await waitFor(() => getRecord(second.id).status === "idle");
 assert.notEqual(first.id, second.id);
 assert.equal(runtimes.size, 2, "different agents receive independent logical runtimes");
+
+const stoppable = unwrap(await manager.start({
+  target: "reviewer",
+  prompt: "hold stoppable",
+  workspaceId: scope.workspaceId,
+  workspaceRoot: root,
+}));
+const survivor = unwrap(await manager.start({
+  target: "reviewer",
+  prompt: "hold survivor",
+  workspaceId: scope.workspaceId,
+  workspaceRoot: root,
+}));
+await waitFor(() => runtimes.get(stoppable.id)?.inputs.length === 1 && runtimes.get(survivor.id)?.inputs.length === 1);
+const stopped = unwrap(await manager.stop(stoppable.id, scope));
+assert.equal(stopped.status, "stopped");
+assert.equal(stopped.errorCode, "PROVIDER_CANCELLED");
+assert.equal(getRecord(survivor.id).status, "running", "stopping one agent must not stop another active agent");
+assert.equal(unwrap(await manager.stop(stoppable.id, scope)).status, "stopped", "stop is idempotent after settlement");
+runtimes.get(survivor.id)!.release();
+await waitFor(() => getRecord(survivor.id).status === "idle");
 
 const failed = unwrap(await manager.start({
   target: "reviewer",

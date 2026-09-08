@@ -10,7 +10,7 @@ import {
 
 const request = decodeLocalAgentDaemonRequest({
   requestId: "req_1",
-  protocolVersion: 3,
+  protocolVersion: 4,
   authToken: "test-secret",
   method: "agent.start",
   params: {
@@ -26,9 +26,24 @@ if (request.method !== "agent.start") throw new Error("expected agent.start requ
 assert.equal(request.params.writeMode, "read_only");
 assert.match(encodeLocalAgentDaemonRequest(request), /"method":"agent.start"/);
 
+const stopRequest = decodeLocalAgentDaemonRequest({
+  requestId: "req_stop",
+  protocolVersion: 4,
+  authToken: "test-secret",
+  method: "agent.stop",
+  params: {
+    id: "agt_1234",
+    scope: { workspaceId: "ws_test", workspaceRoot: "/tmp/project" },
+  },
+});
+assert.equal(stopRequest.method, "agent.stop");
+if (stopRequest.method !== "agent.stop") throw new Error("expected agent.stop request");
+assert.equal(stopRequest.params.id, "agt_1234");
+assert.equal(stopRequest.params.scope.workspaceId, "ws_test");
+
 const whitespaceRequest = decodeLocalAgentDaemonRequest({
   requestId: "req_whitespace",
-  protocolVersion: 3,
+  protocolVersion: 4,
   authToken: "test-secret",
   method: "agent.start",
   params: {
@@ -43,7 +58,7 @@ assert.equal(whitespaceRequest.params.prompt, "  keep prompt whitespace  \n");
 
 const directRequest = decodeLocalAgentDaemonRequest({
   requestId: "req_direct",
-  protocolVersion: 3,
+  protocolVersion: 4,
   authToken: "test-secret",
   method: "agent.start",
   params: {
@@ -58,7 +73,7 @@ assert.equal(directRequest.params.workspaceId, undefined);
 assert.throws(
   () => decodeLocalAgentDaemonRequest({
     requestId: "req_2",
-    protocolVersion: 3,
+    protocolVersion: 4,
     authToken: "test-secret",
     method: "agent.start",
     params: { target: "reviewer", prompt: "" },
@@ -85,7 +100,7 @@ assert.equal(directRecord.workspaceId, undefined);
 
 const response = decodeLocalAgentDaemonResponse({
   requestId: "req_1",
-  protocolVersion: 3,
+  protocolVersion: 4,
   ok: true,
   result: record,
 });
@@ -93,7 +108,7 @@ assert.equal(response.ok, true);
 
 const errorResponse = decodeLocalAgentDaemonResponse(JSON.parse(encodeLocalAgentDaemonResponse({
   requestId: "req_error",
-  protocolVersion: 3,
+  protocolVersion: 4,
   ok: false,
   error: {
     code: "PROVIDER_UNAVAILABLE",

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { Result, type Result as BetterResult } from "better-result";
 import {
+  AgentProviderCancelledError,
   AgentProviderUnavailableError,
   type AgentProviderError,
 } from "./local-agent-errors.js";
@@ -43,6 +44,15 @@ interface SessionEntry {
   releasePromise?: Promise<void>;
 }
 
+interface ActiveAgentRun {
+  readonly runtime: LocalAgentRuntime;
+  providerSessionId?: string;
+  interruptRequested: boolean;
+  interruptPromise?: Promise<BetterResult<boolean, AgentProviderError>>;
+}
+
+export type AgentInterruptStatus = "accepted" | "unsupported" | "not_active";
+
 export interface LocalAgentRuntimePoolOptions {
   now?: () => number;
   logger?: LocalAgentRuntimePoolLogger;
@@ -56,6 +66,7 @@ export interface LocalAgentRuntimePoolOptions {
  */
 export class LocalAgentRuntimePool {
   private readonly entries = new Map<string, RuntimeEntry>();
+  private readonly activeAgentRuns = new Map<string, ActiveAgentRun>();
   private readonly now: () => number;
   private readonly logger?: LocalAgentRuntimePoolLogger;
   private readonly sessionIdleTimeoutMs: number;
@@ -76,6 +87,7 @@ export class LocalAgentRuntimePool {
     context: LocalAgentRuntimeContext,
     input: LocalAgentRunInput,
     inputCallbacks?: LocalAgentRunCallbacks,
+    signal?: AbortSignal,
   ): Promise<BetterResult<LocalAgentRunResult, AgentProviderError>> {
     if (this.closing) return Result.err(poolClosedError(driver, context));
 
@@ -104,6 +116,12 @@ export class LocalAgentRuntimePool {
     }
 
     this.clearIdleTimer(entry);
+    const activeAgentRun: ActiveAgentRun = {
+      runtime,
+      providerSessionId: input.providerSessionId,
+      interruptRequested: false,
+    };
+    this.activeAgentRuns.set(context.agentId, activeAgentRun);
     entry.activeRuns += 1;
     const sessionIds = new Set<string>();
     const reserveSession = async (providerSessionId: string): Promise<AgentProviderError | undefined> => {
@@ -127,13 +145,20 @@ export class LocalAgentRuntimePool {
       onSessionId: async (providerSessionId) => {
         const reservationError = await reserveSession(providerSessionId);
         if (reservationError) throw reservationError;
+        activeAgentRun.providerSessionId = providerSessionId;
         await inputCallbacks?.onSessionId?.(providerSessionId);
+        if (activeAgentRun.interruptRequested) {
+          const interrupted = await this.interruptActiveRun(activeAgentRun);
+          if (interrupted.isErr()) throw interrupted.error;
+        }
       },
     };
     const startedAt = this.now();
     try {
+      if (signal?.aborted) return Result.err(cancelledRunError(driver, context));
       const inputReservationError = await reserveSession(input.providerSessionId ?? "");
       if (inputReservationError) return Result.err(inputReservationError);
+      if (signal?.aborted) return Result.err(cancelledRunError(driver, context));
       const result = await runtime.run(input, callbacks);
       if (result.isErr()) {
         if (!runtime.isAlive()) {
@@ -191,6 +216,9 @@ export class LocalAgentRuntimePool {
       }
       throw error;
     } finally {
+      if (this.activeAgentRuns.get(context.agentId) === activeAgentRun) {
+        this.activeAgentRuns.delete(context.agentId);
+      }
       for (const providerSessionId of sessionIds) {
         const session = entry.sessions.get(providerSessionId);
         if (!session) continue;
@@ -205,6 +233,26 @@ export class LocalAgentRuntimePool {
       entry.lastUsedAt = this.now();
       if (entry.activeRuns === 0 && !entry.closing) this.scheduleIdleClose(entry);
     }
+  }
+
+  async interrupt(agentId: string): Promise<BetterResult<AgentInterruptStatus, AgentProviderError>> {
+    const active = this.activeAgentRuns.get(agentId);
+    if (!active) return Result.ok("not_active");
+    active.interruptRequested = true;
+    if (!active.runtime.interrupt) return Result.ok("unsupported");
+    if (!active.providerSessionId) return Result.ok("accepted");
+    const interrupted = await this.interruptActiveRun(active);
+    if (interrupted.isErr()) return interrupted;
+    return Result.ok(interrupted.value ? "accepted" : "not_active");
+  }
+
+  private async interruptActiveRun(
+    active: ActiveAgentRun,
+  ): Promise<BetterResult<boolean, AgentProviderError>> {
+    if (!active.runtime.interrupt) return Result.ok(false);
+    if (!active.providerSessionId) return Result.ok(true);
+    active.interruptPromise ??= active.runtime.interrupt(active.providerSessionId);
+    return active.interruptPromise;
   }
 
   private async discardRuntime(
@@ -494,6 +542,20 @@ export class LocalAgentRuntimePool {
   ): void {
     this.logger?.(level, event, fields);
   }
+}
+
+function cancelledRunError(
+  driver: LocalAgentDriver,
+  context: LocalAgentRuntimeContext,
+): AgentProviderCancelledError {
+  return new AgentProviderCancelledError({
+    code: "PROVIDER_CANCELLED",
+    provider: driver.provider,
+    agentId: context.agentId,
+    operation: "run",
+    retryable: false,
+    message: `${driver.provider} agent turn was cancelled before provider execution.`,
+  });
 }
 
 function poolClosedError(

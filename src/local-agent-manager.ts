@@ -2,11 +2,14 @@ import { resolve } from "node:path";
 import { Result, type Result as BetterResult } from "better-result";
 import {
   AgentConflictError,
+  AgentProviderCancelledError,
+  AgentProviderUnavailableError,
   AgentScopeError,
   AgentStoreError,
   AgentTargetError,
   isLocalAgentError,
   isProgrammerDefect,
+  type AgentProviderError,
   type LocalAgentError,
 } from "./local-agent-errors.js";
 import {
@@ -70,6 +73,7 @@ export interface LocalAgentManagerOptions {
 export type AgentStartError = AgentTargetError | AgentScopeError | AgentConflictError | AgentStoreError;
 export type AgentContinueError = AgentStartError;
 export type AgentLookupError = AgentTargetError | AgentScopeError | AgentStoreError;
+export type AgentStopError = AgentLookupError | AgentProviderError;
 export type AgentListError = AgentScopeError | AgentStoreError;
 
 /**
@@ -86,7 +90,7 @@ export class LocalAgentManager {
   private readonly allowedRoots?: readonly string[];
   private readonly logger?: LocalAgentManagerLogger;
   private readonly subagents: SubagentsConfig;
-  private readonly activeTurns = new Map<string, Promise<void>>();
+  private readonly activeTurns = new Map<string, { promise: Promise<void>; controller: AbortController }>();
   private accepting = true;
   private closePromise?: Promise<void>;
 
@@ -190,6 +194,33 @@ export class LocalAgentManager {
     return Result.ok(record);
   }
 
+  async stop(
+    agentId: string,
+    scope: LocalAgentWorkspaceScope,
+  ): Promise<BetterResult<LocalAgentRecord, AgentStopError>> {
+    const current = this.get(agentId, scope);
+    if (current.isErr()) return current;
+    const active = this.activeTurns.get(agentId);
+    if (!active) return current;
+
+    active.controller.abort();
+    const interrupted = await this.pool.interrupt(agentId);
+    if (interrupted.isErr()) return Result.err(interrupted.error);
+    if (interrupted.value === "unsupported") {
+      return Result.err(new AgentProviderUnavailableError({
+        code: "PROVIDER_UNAVAILABLE",
+        provider: current.value.provider,
+        agentId,
+        operation: "stop",
+        retryable: false,
+        message: `${current.value.provider} does not support targeted agent turn interruption.`,
+      }));
+    }
+
+    await active.promise.catch(() => undefined);
+    return this.get(agentId, scope);
+  }
+
   list(scope: LocalAgentWorkspaceScope): BetterResult<LocalAgentRecord[], AgentListError> {
     return this.authorizeWorkspace(scope.workspaceRoot, scope.workspaceId, "list").andThen((workspaceRoot) => (
       this.store.listResult({
@@ -202,7 +233,7 @@ export class LocalAgentManager {
   async close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
     this.accepting = false;
-    const turns = Array.from(this.activeTurns.values());
+    const turns = Array.from(this.activeTurns.values(), (turn) => turn.promise);
     this.closePromise = (async () => {
       // Closing pooled runtimes is what interrupts provider turns. Waiting for
       // those turns first can strand a provider process indefinitely.
@@ -258,10 +289,11 @@ export class LocalAgentManager {
     if (updated.isErr()) return updated;
     // Defer invocation until after the tracking entry is visible. This keeps
     // cleanup correct even if runTurn later gains a synchronous completion path.
+    const controller = new AbortController();
     const turn = Promise.resolve().then(() => (
-      this.runTurn(updated.value, prompt, overrides, workspaceId)
+      this.runTurn(updated.value, prompt, overrides, workspaceId, controller.signal)
     ));
-    this.activeTurns.set(record.id, turn);
+    this.activeTurns.set(record.id, { promise: turn, controller });
     void turn.catch(() => undefined);
     return updated;
   }
@@ -271,6 +303,7 @@ export class LocalAgentManager {
     prompt: string,
     overrides: RunOverrides,
     workspaceId?: string,
+    signal?: AbortSignal,
   ): Promise<void> {
     const startedAt = Date.now();
     this.log("info", "agent_run_started", {
@@ -327,7 +360,9 @@ export class LocalAgentManager {
           if (updated.isErr()) throw updated.error;
         },
       };
-      const result = await this.pool.run(driver.value, context, input.value, callbacks);
+      const result = signal?.aborted
+        ? Result.err(cancelledAgentRun(record))
+        : await this.pool.run(driver.value, context, input.value, callbacks, signal);
       if (result.isErr()) {
         this.persistRunError(record, result.error, startedAt);
         return;
@@ -382,13 +417,14 @@ export class LocalAgentManager {
     error: LocalAgentError,
     startedAt: number,
   ): void {
+    const stopped = error.code === "PROVIDER_CANCELLED";
     const persisted = this.store.updateResult(record.id, {
-      status: "error",
+      status: stopped ? "stopped" : "error",
       error: error.message,
       errorCode: error.code,
       errorRetryable: error.retryable,
     });
-    this.log("error", "agent_run_failed", {
+    this.log(stopped ? "info" : "error", stopped ? "agent_run_stopped" : "agent_run_failed", {
       provider: record.provider,
       agentId: record.id,
       providerSessionIdPrefix: record.providerSessionId?.slice(0, 8),
@@ -586,6 +622,17 @@ export class LocalAgentManager {
 
 export function createLocalAgentManager(options: LocalAgentManagerOptions): LocalAgentManager {
   return new LocalAgentManager(options);
+}
+
+function cancelledAgentRun(record: LocalAgentRecord): AgentProviderCancelledError {
+  return new AgentProviderCancelledError({
+    code: "PROVIDER_CANCELLED",
+    provider: record.provider,
+    agentId: record.id,
+    operation: "run",
+    retryable: false,
+    message: `${record.provider} agent turn was cancelled.`,
+  });
 }
 
 function errorMessage(error: unknown): string {

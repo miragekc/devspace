@@ -94,7 +94,7 @@ try {
       if (request.method === "agent.start") {
         socket.end(encodeLocalAgentDaemonResponse({
           requestId: request.requestId,
-          protocolVersion: 3,
+          protocolVersion: 4,
           ok: false,
           error: {
             code: "UNKNOWN_TARGET",
@@ -107,10 +107,12 @@ try {
       }
       const result = request.method === "agent.list"
         ? [current]
-        : request.method === "hello"
+        : request.method === "agent.stop"
+          ? { ...current, status: "stopped" }
+          : request.method === "hello"
           ? {
               state: "ready",
-              protocolVersion: 3,
+              protocolVersion: 4,
               pid: process.pid,
               endpoint: daemonSocket,
               startedAt: "now",
@@ -121,7 +123,7 @@ try {
           : null;
       socket.end(encodeLocalAgentDaemonResponse({
         requestId: request.requestId,
-        protocolVersion: 3,
+        protocolVersion: 4,
         ok: true,
         result,
       }));
@@ -194,6 +196,29 @@ try {
     assert.match(directOutput, new RegExp(current.id));
     const directList = [...daemonRequests].reverse().find((request) => request.method === "agent.list");
     assert.deepEqual(directList?.params, { workspaceRoot: realpathSync.native(projectRoot) });
+
+    await execFileAsync(
+      "node",
+      ["--import", "tsx", "src/cli.ts", "agents", "stop", current.id, "--json"],
+      {
+        cwd: process.cwd(),
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          DEVSPACE_ALLOWED_ROOTS: projectRoot,
+          DEVSPACE_STATE_DIR: stateDir,
+          DEVSPACE_WORKSPACE_ID: "ws_current",
+          DEVSPACE_WORKSPACE_ROOT: projectRoot,
+          DEVSPACE_SUBAGENTS: "1",
+          DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+        },
+      },
+    );
+    const stopRequest = [...daemonRequests].reverse().find((request) => request.method === "agent.stop");
+    assert.deepEqual(stopRequest?.params, {
+      id: current.id,
+      scope: { workspaceId: "ws_current", workspaceRoot: realpathSync.native(projectRoot) },
+    });
 
     let commandFailure: unknown;
     try {

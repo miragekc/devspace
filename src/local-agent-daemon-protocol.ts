@@ -14,6 +14,7 @@ export type LocalAgentDaemonMethod =
   | "hello"
   | "agent.start"
   | "agent.continue"
+  | "agent.stop"
   | "agent.get"
   | "agent.list"
   | "daemon.status"
@@ -24,6 +25,7 @@ export type LocalAgentDaemonRequest =
   | AgentDaemonRequestBase<"hello", Record<string, never>>
   | AgentDaemonRequestBase<"agent.start", StartLocalAgentInput>
   | AgentDaemonRequestBase<"agent.continue", { id: string; prompt: string; scope: LocalAgentWorkspaceScope; overrides?: RunOverrides }>
+  | AgentDaemonRequestBase<"agent.stop", { id: string; scope: LocalAgentWorkspaceScope }>
   | AgentDaemonRequestBase<"agent.get", { id: string; scope: LocalAgentWorkspaceScope }>
   | AgentDaemonRequestBase<"agent.list", LocalAgentWorkspaceScope>
   | AgentDaemonRequestBase<"daemon.status", Record<string, never>>
@@ -114,6 +116,7 @@ export function decodeLocalAgentDaemonRequest(value: unknown): LocalAgentDaemonR
         method,
         params: decodeContinueInput(params),
       } as LocalAgentDaemonRequest;
+    case "agent.stop":
     case "agent.get":
       return {
         requestId,
