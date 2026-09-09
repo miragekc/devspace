@@ -36,6 +36,7 @@ class FakeManager implements LocalAgentDaemonManager {
   runtimeCount = 0;
   closed = false;
   lastInput?: StartLocalAgentInput;
+  lastStoppedAgentId?: string;
 
   async start(input: StartLocalAgentInput) {
     this.lastInput = input;
@@ -49,6 +50,11 @@ class FakeManager implements LocalAgentDaemonManager {
     _scope: { workspaceId: string; workspaceRoot: string },
   ) {
     return Result.ok({ ...record, status: "running" } as LocalAgentRecord);
+  }
+
+  async stop(agentId: string, _scope: { workspaceId: string; workspaceRoot: string }) {
+    this.lastStoppedAgentId = agentId;
+    return Result.ok({ ...record, status: "stopped" as const });
   }
 
   get(_id: string, _scope: { workspaceId: string; workspaceRoot: string }) {
@@ -126,6 +132,8 @@ try {
   assert.equal(unwrap(await client.get(record.id, recordScope)).id, record.id);
   assert.equal(unwrap(await client.list(recordScope))[0]?.id, record.id);
   assert.equal(unwrap(await client.status()).state, "ready");
+  assert.equal(unwrap(await client.stopAgent(record.id, recordScope)).status, "stopped");
+  assert.equal(manager.lastStoppedAgentId, record.id);
 
   unwrap(await client.stop());
   await waitFor(() => manager.closed && !existsSync(daemon.paths.socketPath));
@@ -237,7 +245,7 @@ const legacyServer = createNetServer((socket) => {
         ok: false,
         error: {
           code: "DAEMON_PROTOCOL_MISMATCH",
-          message: "Unsupported daemon protocol version 3; expected 1.",
+          message: "Unsupported daemon protocol version 4; expected 1.",
           retryable: false,
         },
       }));
@@ -291,10 +299,10 @@ const upgradeClient = new LocalAgentClient({
   },
 });
 try {
-  assert.equal(unwrap(await upgradeClient.ensureReady()).protocolVersion, 3);
+  assert.equal(unwrap(await upgradeClient.ensureReady()).protocolVersion, 4);
   assert.equal(replacementSpawns, 1);
   assert.equal(spawnedBeforeLegacyLockReleased, false);
-  assert.deepEqual(legacyMethods.slice(0, 3), ["hello:3", "hello:1", "daemon.stop:1"]);
+  assert.deepEqual(legacyMethods.slice(0, 3), ["hello:4", "hello:1", "daemon.stop:1"]);
 } finally {
   legacyLock.release();
   await replacementDaemon.close();
@@ -387,11 +395,11 @@ const timeoutServer = createNetServer((socket) => {
     if (request.method !== "hello") return;
     socket.end(encodeLocalAgentDaemonResponse({
       requestId: request.requestId,
-      protocolVersion: 3,
+      protocolVersion: 4,
       ok: true,
       result: {
         state: "ready",
-        protocolVersion: 3,
+        protocolVersion: 4,
         pid: process.pid,
         endpoint: timeoutPaths.endpoint,
         startedAt: "now",
@@ -433,7 +441,7 @@ const invalidServer = createNetServer((socket) => {
     if (!buffer.includes("\n")) return;
     socket.end(encodeLocalAgentDaemonResponse({
       requestId: "wrong_request_id",
-      protocolVersion: 3,
+      protocolVersion: 4,
       ok: true,
       result: {},
     }));
@@ -487,7 +495,7 @@ try {
 
   const unauthorized = await sendRawRequest(socketDaemon.paths.endpoint, JSON.stringify({
     requestId: "unauthorized",
-    protocolVersion: 3,
+    protocolVersion: 4,
     authToken: "wrong-secret",
     method: "hello",
     params: {},

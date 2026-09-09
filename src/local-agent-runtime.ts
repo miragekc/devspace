@@ -53,6 +53,7 @@ export interface LocalAgentRuntime {
     input: LocalAgentRunInput,
     callbacks?: LocalAgentRunCallbacks,
   ): Promise<Result<LocalAgentRunResult, AgentProviderError>>;
+  interrupt?(providerSessionId: string): Promise<Result<boolean, AgentProviderError>>;
   releaseSession(providerSessionId: string): Promise<void>;
   close(): Promise<void>;
   isAlive(): boolean;

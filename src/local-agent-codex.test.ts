@@ -57,6 +57,7 @@ if (process.platform !== "win32") {
   await writeFile(command, `#!/usr/bin/env node
 import readline from "node:readline";
 let turn = 0;
+const activeTurns = new Map();
 const output = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
 readline.createInterface({ input: process.stdin }).on("line", (line) => {
   const message = JSON.parse(line);
@@ -72,10 +73,26 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
     output({ id: message.id, result: {} });
     return;
   }
+  if (message.method === "turn/interrupt") {
+    output({ id: message.id, result: {} });
+    const active = activeTurns.get(message.params.turnId);
+    if (active) {
+      activeTurns.delete(message.params.turnId);
+      setImmediate(() => output({ method: "turn/completed", params: {
+        threadId: active.threadId,
+        turn: { id: message.params.turnId, status: "interrupted", items: [] },
+      } }));
+    }
+    return;
+  }
   if (message.method === "turn/start") {
     turn += 1;
     const turnId = "turn_" + turn;
     output({ id: message.id, result: { turn: { id: turnId } } });
+    if (message.params.input[0].text === "hold") {
+      activeTurns.set(turnId, { threadId: message.params.threadId });
+      return;
+    }
     setImmediate(() => {
       if (message.params.input[0].text === "fail") {
         output({ method: "turn/completed", params: { threadId: message.params.threadId, turn: { id: turnId, status: "failed", error: { message: "fake failure" } } } });
@@ -145,6 +162,48 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
       assert.ok(protocolFailure.error.cause, "provider protocol cause remains available internally");
       assert.equal("cause" in toAgentErrorPayload(protocolFailure.error), false);
     }
+    let resolveHeldSession!: (id: string) => void;
+    let resolveOtherSession!: (id: string) => void;
+    const heldSession = new Promise<string>((resolve) => { resolveHeldSession = resolve; });
+    const otherSession = new Promise<string>((resolve) => { resolveOtherSession = resolve; });
+    const held = runtime.run({
+      prompt: "hold",
+      workspaceRoot: "/tmp/project",
+      providerSessionId: first.providerSessionId ?? undefined,
+    }, { onSessionId: (id) => resolveHeldSession(id) });
+    let otherSettled = false;
+    const other = runtime.run({
+      prompt: "hold",
+      workspaceRoot: "/tmp/project",
+      providerSessionId: "thread_other",
+    }, { onSessionId: (id) => resolveOtherSession(id) });
+    void other.finally(() => { otherSettled = true; });
+    const [heldThreadId, otherThreadId] = await Promise.all([heldSession, otherSession]);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const interrupt = await runtime.interrupt(heldThreadId);
+    assert.equal(interrupt.isOk(), true);
+    if (interrupt.isErr()) throw interrupt.error;
+    assert.equal(interrupt.value, true);
+    const interrupted = await held;
+    assert.equal(interrupted.isErr(), true);
+    if (interrupted.isErr()) assert.equal(interrupted.error.code, "PROVIDER_CANCELLED");
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(otherSettled, false, "interrupting one Codex thread must not settle another active thread");
+    const otherInterrupt = await runtime.interrupt(otherThreadId);
+    assert.equal(otherInterrupt.isOk(), true);
+    if (otherInterrupt.isErr()) throw otherInterrupt.error;
+    assert.equal(otherInterrupt.value, true);
+    const otherInterrupted = await other;
+    assert.equal(otherInterrupted.isErr(), true);
+    assert.equal(runtime.isAlive(), true, "interrupting one turn must keep the shared Codex app-server alive");
+    const afterInterrupt = await runtime.run({
+      prompt: "after interrupt",
+      workspaceRoot: "/tmp/project",
+      providerSessionId: heldThreadId,
+    });
+    assert.equal(afterInterrupt.isOk(), true);
+
     await runtime.releaseSession("thread_new");
   } finally {
     await runtime.close();

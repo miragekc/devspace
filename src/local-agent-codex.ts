@@ -85,6 +85,8 @@ export class CodexAppServerRuntime implements LocalAgentRuntime {
   private readonly rpc: CodexAppServerRpc;
   private alive = true;
   private closePromise?: Promise<void>;
+  private readonly preparingThreads = new Set<string>();
+  private readonly interruptedPreparingThreads = new Set<string>();
 
   constructor(private readonly options: CodexAppServerRuntimeOptions) {
     this.child = spawn(options.command, ["app-server"], {
@@ -129,51 +131,80 @@ export class CodexAppServerRuntime implements LocalAgentRuntime {
             message: "Codex app-server is not running.",
           });
         }
-        const threadResponse = await this.rpc.request(
-          input.providerSessionId ? "thread/resume" : "thread/start",
-          threadParams(input),
-        );
-        const threadId = readString(asRecord(threadResponse)?.thread, "id");
-        if (!threadId) {
-          throw new AgentProviderProtocolError({
-            code: "PROVIDER_PROTOCOL_ERROR",
-            provider: this.provider,
-            operation: "open_thread",
-            retryable: false,
-            cause: threadResponse,
-            message: "Codex app-server did not return a thread id.",
-          });
-        }
+        const knownThreadId = input.providerSessionId;
+        if (knownThreadId) this.preparingThreads.add(knownThreadId);
+        let threadId: string | undefined;
+        try {
+          const threadResponse = await this.rpc.request(
+            input.providerSessionId ? "thread/resume" : "thread/start",
+            threadParams(input),
+          );
+          threadId = readString(asRecord(threadResponse)?.thread, "id");
+          if (!threadId) {
+            throw new AgentProviderProtocolError({
+              code: "PROVIDER_PROTOCOL_ERROR",
+              provider: this.provider,
+              operation: "open_thread",
+              retryable: false,
+              cause: threadResponse,
+              message: "Codex app-server did not return a thread id.",
+            });
+          }
 
-        await callbacks?.onSessionId?.(threadId);
-        const completed = await this.rpc.runTurn(threadId, turnParams(input, threadId));
-        const parsed = parseCompletedTurn(completed.event.params, completed.items);
-        if (parsed.failure) {
-          throw new AgentProviderExecutionError({
-            code: "PROVIDER_EXECUTION_ERROR",
+          this.preparingThreads.add(threadId);
+          await callbacks?.onSessionId?.(threadId);
+          if (this.interruptedPreparingThreads.delete(threadId)) throw abortTurnError();
+          this.preparingThreads.delete(threadId);
+          const completed = await this.rpc.runTurn(threadId, turnParams(input, threadId));
+          if (turnCompletionStatus(completed.event.params) === "interrupted") throw abortTurnError();
+          const parsed = parseCompletedTurn(completed.event.params, completed.items);
+          if (parsed.failure) {
+            throw new AgentProviderExecutionError({
+              code: "PROVIDER_EXECUTION_ERROR",
+              provider: this.provider,
+              operation: "run",
+              retryable: false,
+              cause: completed.event.params,
+              message: "Codex agent turn failed.",
+            });
+          }
+          if (!parsed.finalResponse.trim()) {
+            throw new AgentProviderProtocolError({
+              code: "PROVIDER_PROTOCOL_ERROR",
+              provider: this.provider,
+              operation: "run",
+              retryable: false,
+              cause: completed.event.params,
+              message: "Codex did not return a final assistant response.",
+            });
+          }
+          return {
             provider: this.provider,
-            operation: "run",
-            retryable: false,
-            cause: completed.event.params,
-            message: "Codex agent turn failed.",
-          });
+            providerSessionId: threadId,
+            finalResponse: parsed.finalResponse.trim(),
+            items: parsed.items,
+          };
+        } finally {
+          if (knownThreadId) this.preparingThreads.delete(knownThreadId);
+          if (threadId) {
+            this.preparingThreads.delete(threadId);
+            this.interruptedPreparingThreads.delete(threadId);
+          }
         }
-        if (!parsed.finalResponse.trim()) {
-          throw new AgentProviderProtocolError({
-            code: "PROVIDER_PROTOCOL_ERROR",
-            provider: this.provider,
-            operation: "run",
-            retryable: false,
-            cause: completed.event.params,
-            message: "Codex did not return a final assistant response.",
-          });
+      },
+    });
+  }
+
+  async interrupt(providerSessionId: string) {
+    return captureAgentProviderResult({
+      provider: this.provider,
+      operation: "interrupt",
+      run: async (): Promise<boolean> => {
+        if (this.preparingThreads.has(providerSessionId)) {
+          this.interruptedPreparingThreads.add(providerSessionId);
+          return true;
         }
-        return {
-          provider: this.provider,
-          providerSessionId: threadId,
-          finalResponse: parsed.finalResponse.trim(),
-          items: parsed.items,
-        };
+        return this.rpc.interruptTurn(providerSessionId);
       },
     });
   }
@@ -320,6 +351,8 @@ interface CodexTurnAccumulator {
   turnId?: string;
   items: unknown[];
   completed?: CodexEvent;
+  interruptRequested?: boolean;
+  interruptPromise?: Promise<void>;
   resolve: (result: CodexTurnResult) => void;
   reject: (error: Error) => void;
 }
@@ -378,11 +411,29 @@ class CodexAppServerRpc {
     try {
       const response = await this.request("turn/start", params);
       turn.turnId = readString(asRecord(response)?.turn, "id");
+      if (turn.interruptRequested) await this.sendTurnInterrupt(turn);
       if (turn.completed) return { event: turn.completed, items: turn.items };
       return await completion;
     } finally {
       if (this.turns.get(threadId) === turn) this.turns.delete(threadId);
     }
+  }
+
+  async interruptTurn(threadId: string): Promise<boolean> {
+    const turn = this.turns.get(threadId);
+    if (!turn) return false;
+    turn.interruptRequested = true;
+    if (turn.turnId) await this.sendTurnInterrupt(turn);
+    return true;
+  }
+
+  private async sendTurnInterrupt(turn: CodexTurnAccumulator): Promise<void> {
+    if (!turn.turnId) return;
+    turn.interruptPromise ??= this.request("turn/interrupt", {
+      threadId: turn.threadId,
+      turnId: turn.turnId,
+    }).then(() => undefined);
+    await turn.interruptPromise;
   }
 
   fail(error: Error): void {
@@ -488,6 +539,16 @@ function sandboxPolicyFor(writeMode: LocalAgentWriteMode | undefined): Record<st
     case "read_only":
     case undefined: return { type: "readOnly" };
   }
+}
+
+function turnCompletionStatus(params: unknown): string | undefined {
+  return directString(asRecord(asRecord(params)?.turn)?.status);
+}
+
+function abortTurnError(): Error {
+  const error = new Error("Codex agent turn was interrupted.");
+  error.name = "AbortError";
+  return error;
 }
 
 function parseCompletedTurn(params: unknown, items: unknown[]): {
