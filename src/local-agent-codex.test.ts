@@ -9,6 +9,7 @@ import {
   parseCodexVersion,
   resolveCodexCommand,
   sandboxFor,
+  shouldAcceptWindowsComputerUseElicitation,
 } from "./local-agent-codex.js";
 import { toAgentErrorPayload } from "./local-agent-errors.js";
 
@@ -22,6 +23,30 @@ assert.equal(
   codexCommandEnvironment({ CODEX_INTERNAL_ORIGINATOR_OVERRIDE: "test", PATH: "/tmp/bin" }).CODEX_INTERNAL_ORIGINATOR_OVERRIDE,
   undefined,
 );
+assert.equal(shouldAcceptWindowsComputerUseElicitation({
+  serverName: "node_repl",
+  request: {
+    mode: "form",
+    message: "Allow Codex to use 微信开发者工具?",
+    requestedSchema: { type: "object", properties: {} },
+  },
+}, "使用 Computer Use，只读观察当前微信开发者工具窗口。"), true);
+assert.equal(shouldAcceptWindowsComputerUseElicitation({
+  serverName: "node_repl",
+  request: {
+    mode: "form",
+    message: "Allow Codex to use 任务管理器?",
+    requestedSchema: { type: "object", properties: {} },
+  },
+}, "使用 Computer Use，只读观察当前微信开发者工具窗口。"), false);
+assert.equal(shouldAcceptWindowsComputerUseElicitation({
+  serverName: "other_mcp",
+  request: {
+    mode: "form",
+    message: "Allow Codex to use 微信开发者工具?",
+    requestedSchema: { type: "object", properties: {} },
+  },
+}, "使用 Computer Use，只读观察当前微信开发者工具窗口。"), false);
 
 if (process.platform !== "win32") {
   const root = await mkdtemp(join(tmpdir(), "devspace-codex-app-server-test-"));

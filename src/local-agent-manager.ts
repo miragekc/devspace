@@ -316,6 +316,7 @@ export class LocalAgentManager {
         writeMode: input.value.writeMode,
         model: input.value.model,
         effort: input.value.effort,
+        computerUse: profile.value?.computerUse,
         agentDir: this.agentDir,
       };
       const callbacks: LocalAgentRunCallbacks = {

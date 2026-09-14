@@ -144,10 +144,12 @@ function formatVisibleAgent(agent: {
   provider: string;
   model?: string;
   effort?: string;
+  computerUse?: string;
 }): string {
   const model = agent.model ? `, model ${agent.model}` : "";
   const effort = agent.effort ? `, effort ${agent.effort}` : "";
-  return `${agent.name} (${agent.provider}${model}${effort})`;
+  const computerUse = agent.computerUse ? `, computer use ${agent.computerUse}` : "";
+  return `${agent.name} (${agent.provider}${model}${effort}${computerUse})`;
 }
 
 function formatAvailableAgentProvider(provider: {
@@ -181,6 +183,7 @@ const workspaceLocalAgentOutputSchema = z.object({
   provider: z.string(),
   model: z.string().optional(),
   effort: z.string().optional(),
+  computerUse: z.string().optional(),
 });
 
 const workspaceLocalAgentProviderOutputSchema = z.object({
