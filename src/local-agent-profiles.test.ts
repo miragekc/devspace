@@ -44,6 +44,21 @@ try {
     ].join("\n"),
   );
   await writeFile(
+    join(workspaceRoot, ".devspace", "agents", "codex-windows.md"),
+    [
+      "---",
+      "name: codex-windows",
+      "description: Project attempt to override builtin.",
+      "provider: claude",
+      "model: sonnet",
+      "effort: low",
+      "---",
+      "",
+      "Do not use this body.",
+      "",
+    ].join("\n"),
+  );
+  await writeFile(
     join(workspaceRoot, ".devspace", "agents", "disabled.md"),
     [
       "---",
@@ -57,6 +72,20 @@ try {
       "",
     ].join("\n"),
   );
+  await writeFile(
+    join(workspaceRoot, ".devspace", "agents", "invalid-windows.md"),
+    [
+      "---",
+      "name: invalid-windows",
+      "description: Invalid Windows Computer Use provider.",
+      "provider: claude",
+      "computer_use: windows",
+      "---",
+      "",
+      "Invalid body.",
+      "",
+    ].join("\n"),
+  );
 
   const enabledConfig = loadConfig(writeTestDevspaceConfig(configDir, {
     workspaces: { allowedRoots: [workspaceRoot] },
@@ -64,13 +93,18 @@ try {
   }));
   const profiles = await loadLocalAgentProfiles(enabledConfig, workspaceRoot);
 
-  assert.equal(profiles.length, 1);
-  assert.equal(profiles[0]?.name, "reviewer");
-  assert.equal(profiles[0]?.description, "Project reviewer #1.");
-  assert.equal(profiles[0]?.provider, "claude");
-  assert.equal(profiles[0]?.model, "sonnet");
-  assert.equal(profiles[0]?.effort, "high");
-  assert.equal(profiles[0]?.body, "Project body.");
+  assert.equal(profiles.length, 2);
+  assert.equal(profiles[0]?.name, "codex-windows");
+  assert.equal(profiles[0]?.provider, "codex");
+  assert.equal(profiles[0]?.model, "gpt-5.6-luna");
+  assert.equal(profiles[0]?.effort, "max");
+  assert.equal(profiles[0]?.computerUse, "windows");
+  assert.equal(profiles[1]?.name, "reviewer");
+  assert.equal(profiles[1]?.description, "Project reviewer #1.");
+  assert.equal(profiles[1]?.provider, "claude");
+  assert.equal(profiles[1]?.model, "sonnet");
+  assert.equal(profiles[1]?.effort, "high");
+  assert.equal(profiles[1]?.body, "Project body.");
   await writeFile(
     join(workspaceRoot, ".devspace", "agents", "custom.md"),
     [
@@ -85,7 +119,7 @@ try {
     ].join("\n"),
   );
   const profilesWithInvalid = await loadLocalAgentProfiles(enabledConfig, workspaceRoot);
-  assert.deepEqual(profilesWithInvalid.map((profile) => profile.name), ["reviewer"]);
+  assert.deepEqual(profilesWithInvalid.map((profile) => profile.name), ["codex-windows", "reviewer"]);
 
   const disabledConfig = loadConfig(writeTestDevspaceConfig(configDir, {
     workspaces: { allowedRoots: [workspaceRoot] },

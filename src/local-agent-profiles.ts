@@ -16,12 +16,15 @@ export const LOCAL_AGENT_PROVIDERS: readonly LocalAgentProvider[] = [
   "grok",
 ];
 
+export type LocalAgentComputerUse = "windows";
+
 export interface LocalAgentProfile {
   name: string;
   description: string;
   provider: LocalAgentProvider;
   model?: string;
   effort?: string;
+  computerUse?: LocalAgentComputerUse;
   filePath: string;
   body: string;
   disabled: boolean;
@@ -33,6 +36,7 @@ export interface LocalAgentProfileSummary {
   provider: LocalAgentProvider;
   model?: string;
   effort?: string;
+  computerUse?: LocalAgentComputerUse;
 }
 
 interface ParsedFrontmatter {
@@ -42,6 +46,24 @@ interface ParsedFrontmatter {
 
 const FRONTMATTER_DELIMITER = "---";
 const PROVIDERS = new Set<LocalAgentProvider>(LOCAL_AGENT_PROVIDERS);
+const BUILTIN_PROFILES: readonly LocalAgentProfile[] = [
+  {
+    name: "codex-windows",
+    description: "Codex with the official Windows Computer Use backend.",
+    provider: "codex",
+    model: "gpt-5.6-luna",
+    effort: "max",
+    computerUse: "windows",
+    filePath: "builtin:codex-windows",
+    body: [
+      "Use the installed official Windows Computer Use skill and @oai/sky backend for GUI work.",
+      "Fail closed if the current interactive Windows desktop cannot be attached.",
+      "Do not substitute shell inspection or another GUI automation stack for requested Computer Use work.",
+      "Respect the task's stated read/write/deploy limits exactly.",
+    ].join(" "),
+    disabled: false,
+  },
+];
 
 export async function loadLocalAgentProfiles(
   config: ServerConfig,
@@ -61,6 +83,7 @@ export async function loadLocalAgentProfiles(
       profilesByName.set(profile.name, profile);
     }
   }
+  for (const profile of BUILTIN_PROFILES) profilesByName.set(profile.name, profile);
 
   return Array.from(profilesByName.values())
     .filter((profile) => options.includeDisabled || !profile.disabled)
@@ -138,8 +161,12 @@ function profileFromFrontmatter(
   const name = readString(frontmatter, "name") ?? basename(filePath, ".md");
   const description = readString(frontmatter, "description");
   const provider = readProvider(frontmatter, filePath);
+  const computerUse = readComputerUse(frontmatter, filePath);
   if (!description) {
     throw new Error(`Subagent profile is missing description: ${filePath}`);
+  }
+  if (computerUse && provider !== "codex") {
+    throw new Error(`Subagent profile computer_use requires provider codex: ${filePath}`);
   }
 
   return {
@@ -148,6 +175,7 @@ function profileFromFrontmatter(
     provider,
     model: readString(frontmatter, "model"),
     effort: readString(frontmatter, "effort"),
+    computerUse,
     filePath,
     body,
     disabled: frontmatter.disabled === true,
@@ -169,6 +197,16 @@ function readProvider(frontmatter: Record<string, unknown>, filePath: string): L
 
 export function isLocalAgentProvider(value: string): value is LocalAgentProvider {
   return PROVIDERS.has(value as LocalAgentProvider);
+}
+
+function readComputerUse(
+  frontmatter: Record<string, unknown>,
+  filePath: string,
+): LocalAgentComputerUse | undefined {
+  const value = readString(frontmatter, "computer_use");
+  if (value === undefined || value === "false") return undefined;
+  if (value === "windows") return value;
+  throw new Error(`Subagent profile computer_use must be windows or false: ${filePath}`);
 }
 
 function readString(frontmatter: Record<string, unknown>, key: string): string | undefined {

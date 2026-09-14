@@ -44,6 +44,17 @@ const profiles: LocalAgentProfile[] = [
     disabled: false,
   },
   {
+    name: "codex-windows",
+    description: "Use Windows Computer Use.",
+    provider: "codex",
+    model: "gpt-5.6-luna",
+    effort: "max",
+    computerUse: "windows",
+    filePath: "builtin:codex-windows",
+    body: "Use Computer Use.",
+    disabled: false,
+  },
+  {
     name: "claude-reviewer",
     description: "Unavailable profile.",
     provider: "claude",
@@ -54,7 +65,8 @@ const profiles: LocalAgentProfile[] = [
 ];
 const catalog = buildLocalAgentCatalog(config, profiles, statuses);
 assert.deepEqual(catalog.providers.map((provider) => provider.id), ["codex", "claude"]);
-assert.deepEqual(catalog.profiles.map((profile) => profile.name), ["reviewer", "custom"]);
+assert.deepEqual(catalog.profiles.map((profile) => profile.name), ["reviewer", "custom", "codex-windows"]);
 assert.equal(catalog.profiles[0]?.model, "gpt-default");
 assert.equal(catalog.profiles[0]?.effort, "medium");
 assert.equal(catalog.profiles[1]?.model, "gpt-custom");
+assert.equal(catalog.profiles[2]?.computerUse, "windows");

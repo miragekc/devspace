@@ -1,6 +1,7 @@
 import { homedir } from "node:os";
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { delimiter, join, resolve } from "node:path";
+import { createConnection } from "node:net";
 import { createInterface } from "node:readline";
 import {
   AgentProviderExecutionError,
@@ -24,6 +25,12 @@ import type {
 export interface ResolvedCodexCommand {
   executable: string;
   version?: string;
+}
+
+interface ResolvedWindowsComputerUseRuntime {
+  executable: string;
+  version?: string;
+  nativePipe: string;
 }
 
 export type CodexCommandResolver = (env: NodeJS.ProcessEnv) => ResolvedCodexCommand | undefined;
@@ -74,10 +81,66 @@ export function parseCodexVersion(output: string | undefined): string | undefine
   return match?.[1];
 }
 
+export function resolveWindowsComputerUseRuntime(
+  command: string,
+  env: NodeJS.ProcessEnv = process.env,
+): ResolvedWindowsComputerUseRuntime | undefined {
+  if (process.platform !== "win32") return undefined;
+  const result = spawnSync(command, ["mcp", "get", "node_repl", "--json"], {
+    encoding: "utf8",
+    env: codexCommandEnvironment(env),
+    windowsHide: true,
+    timeout: 5_000,
+    shell: usesWindowsCommandShell(command),
+  });
+  if (result.error || result.status !== 0 || !result.stdout.trim()) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(result.stdout);
+  } catch {
+    return undefined;
+  }
+  const transport = asRecord(asRecord(parsed)?.transport);
+  const nodeReplEnv = asRecord(transport?.env);
+  const executable = directString(nodeReplEnv?.CODEX_CLI_PATH);
+  const nativePipe = directString(nodeReplEnv?.SKY_CUA_NATIVE_PIPE_DIRECTORY);
+  const pipeEnabled = directString(nodeReplEnv?.SKY_CUA_NATIVE_PIPE) === "1";
+  const trustedServices = directString(nodeReplEnv?.NODE_REPL_TRUSTED_SERVICES) ?? "";
+  if (!executable || !nativePipe || !pipeEnabled || !trustedServices.includes("@oai/sky/service")) return undefined;
+  const versionResult = spawnSync(executable, ["--version"], {
+    encoding: "utf8",
+    env: codexCommandEnvironment(env),
+    windowsHide: true,
+    timeout: 5_000,
+    shell: usesWindowsCommandShell(executable),
+  });
+  if (versionResult.error || versionResult.status !== 0) return undefined;
+  return { executable, version: parseCodexVersion(versionResult.stdout), nativePipe };
+}
+
+async function canConnectNativePipe(nativePipe: string, timeoutMs = 1_000): Promise<boolean> {
+  if (process.platform !== "win32") return false;
+  return new Promise((resolve) => {
+    const socket = createConnection(nativePipe);
+    let settled = false;
+    const finish = (value: boolean) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(value);
+    };
+    socket.once("connect", () => finish(true));
+    socket.once("error", () => finish(false));
+    socket.setTimeout(timeoutMs, () => finish(false));
+  });
+}
+
 export interface CodexAppServerRuntimeOptions {
   command: string;
   env: NodeJS.ProcessEnv;
   version?: string;
+  appServerArgs?: string[];
+  computerUse?: "windows";
 }
 
 export class CodexAppServerRuntime implements LocalAgentRuntime {
@@ -88,14 +151,14 @@ export class CodexAppServerRuntime implements LocalAgentRuntime {
   private closePromise?: Promise<void>;
 
   constructor(private readonly options: CodexAppServerRuntimeOptions) {
-    this.child = spawn(options.command, ["app-server"], {
+    this.child = spawn(options.command, options.appServerArgs ?? ["app-server"], {
       env: options.env,
       stdio: ["pipe", "pipe", "pipe"],
       detached: process.platform !== "win32",
       windowsHide: true,
       shell: usesWindowsCommandShell(options.command),
     });
-    this.rpc = new CodexAppServerRpc(this.child, options.version);
+    this.rpc = new CodexAppServerRpc(this.child, options.version, options.computerUse);
     this.child.once("exit", (code, signal) => {
       this.alive = false;
       this.rpc.fail(new Error(
@@ -111,7 +174,14 @@ export class CodexAppServerRuntime implements LocalAgentRuntime {
   async initialize(): Promise<void> {
     await this.rpc.request("initialize", {
       clientInfo: { name: "devspace", title: "DevSpace", version: DEVSPACE_VERSION },
-      capabilities: {},
+      capabilities: this.options.computerUse === "windows"
+        ? {
+            extensions: {
+              "openai/form": {},
+              "openai/elicitation": { form: {} },
+            },
+          }
+        : {},
     });
     this.rpc.notify("initialized");
   }
@@ -132,7 +202,7 @@ export class CodexAppServerRuntime implements LocalAgentRuntime {
         }
         const threadResponse = await this.rpc.request(
           input.providerSessionId ? "thread/resume" : "thread/start",
-          threadParams(input),
+          threadParams(input, this.options.computerUse),
         );
         const threadId = readString(asRecord(threadResponse)?.thread, "id");
         if (!threadId) {
@@ -147,7 +217,13 @@ export class CodexAppServerRuntime implements LocalAgentRuntime {
         }
 
         await callbacks?.onSessionId?.(threadId);
-        const completed = await this.rpc.runTurn(threadId, turnParams(input, threadId));
+        if (this.options.computerUse === "windows") this.rpc.setComputerUsePrompt(threadId, input.prompt);
+        let completed;
+        try {
+          completed = await this.rpc.runTurn(threadId, turnParams(input, threadId, this.options.computerUse));
+        } finally {
+          if (this.options.computerUse === "windows") this.rpc.clearComputerUsePrompt(threadId);
+        }
         const parsed = parseCompletedTurn(completed.event.params, completed.items);
         if (parsed.failure) {
           throw new AgentProviderExecutionError({
@@ -240,14 +316,20 @@ export class CodexLocalAgentDriver implements LocalAgentDriver {
     private readonly commandResolver: CodexCommandResolver = resolveCodexCommand,
   ) {}
 
-  runtimeKey(_context: LocalAgentRuntimeContext): string {
+  runtimeKey(context: LocalAgentRuntimeContext): string {
     const command = this.resolveCommand();
-    const executable = command?.executable ?? this.env.CODEX_COMMAND ?? "codex";
     const codexHome = resolve(this.env.CODEX_HOME ?? join(homedir(), ".codex"));
+    if (context.computerUse === "windows") {
+      const desktop = command
+        ? resolveWindowsComputerUseRuntime(command.executable, this.env)
+        : undefined;
+      return `codex-windows:${desktop?.executable ?? "unavailable"}:${codexHome}`;
+    }
+    const executable = command?.executable ?? this.env.CODEX_COMMAND ?? "codex";
     return `codex:${executable}:${codexHome}`;
   }
 
-  async createRuntime(_context: LocalAgentRuntimeContext) {
+  async createRuntime(context: LocalAgentRuntimeContext) {
     return captureAgentProviderResult({
       provider: this.provider,
       operation: "create_runtime",
@@ -262,19 +344,60 @@ export class CodexLocalAgentDriver implements LocalAgentDriver {
             message: "Codex executable was not found.",
           });
         }
-        if (!isCodexAppServerSupported(command.executable, this.env)) {
+        const windowsComputerUse = context.computerUse === "windows"
+          ? resolveWindowsComputerUseRuntime(command.executable, this.env)
+          : undefined;
+        if (context.computerUse === "windows" && process.platform !== "win32") {
           throw new AgentProviderUnavailableError({
             code: "PROVIDER_UNAVAILABLE",
             provider: this.provider,
             operation: "create_runtime",
             retryable: false,
-            message: "Installed Codex does not support app-server.",
+            message: "DESKTOP_SESSION_UNAVAILABLE: Windows Computer Use requires the Windows host.",
+          });
+        }
+        if (context.computerUse === "windows" && !windowsComputerUse) {
+          throw new AgentProviderUnavailableError({
+            code: "PROVIDER_UNAVAILABLE",
+            provider: this.provider,
+            operation: "create_runtime",
+            retryable: false,
+            message: "COMPUTER_USE_BACKEND_UNAVAILABLE: Codex Desktop Windows Computer Use configuration was not found.",
+          });
+        }
+        if (windowsComputerUse && !await canConnectNativePipe(windowsComputerUse.nativePipe)) {
+          throw new AgentProviderUnavailableError({
+            code: "PROVIDER_UNAVAILABLE",
+            provider: this.provider,
+            operation: "create_runtime",
+            retryable: true,
+            message: "DESKTOP_SESSION_UNAVAILABLE: Codex Desktop Windows Computer Use native pipe is not reachable.",
+          });
+        }
+        const runtimeCommand = windowsComputerUse ?? command;
+        if (!isCodexAppServerSupported(runtimeCommand.executable, this.env)) {
+          throw new AgentProviderUnavailableError({
+            code: "PROVIDER_UNAVAILABLE",
+            provider: this.provider,
+            operation: "create_runtime",
+            retryable: false,
+            message: context.computerUse === "windows"
+              ? "COMPUTER_USE_BACKEND_UNAVAILABLE: Codex Desktop does not support app-server."
+              : "Installed Codex does not support app-server.",
           });
         }
         const runtime = new CodexAppServerRuntime({
-          command: command.executable,
+          command: runtimeCommand.executable,
           env: codexCommandEnvironment(this.env),
-          version: command.version,
+          version: runtimeCommand.version,
+          ...(windowsComputerUse ? {
+            appServerArgs: [
+              "-c", "plugins.computer-use@openai-bundled.enabled=true",
+              "-c", "plugins.unified-computer-use@openai-bundled.enabled=false",
+              "app-server",
+            ],
+            computerUse: "windows" as const,
+          } : {}),
         });
         try {
           await runtime.initialize();
@@ -286,8 +409,10 @@ export class CodexLocalAgentDriver implements LocalAgentDriver {
             provider: this.provider,
             operation: "create_runtime",
             retryable: true,
-            cause: codexAppServerError(errorMessage(cause), command.version),
-            message: "Codex app-server initialization failed.",
+            cause: codexAppServerError(errorMessage(cause), runtimeCommand.version),
+            message: context.computerUse === "windows"
+              ? "COMPUTER_USE_ATTACH_FAILED: Codex Desktop app-server initialization failed."
+              : "Codex app-server initialization failed.",
           });
         }
       },
@@ -331,6 +456,7 @@ class CodexAppServerRpc {
     reject: (error: Error) => void;
   }>();
   private readonly turns = new Map<string, CodexTurnAccumulator>();
+  private readonly computerUsePrompts = new Map<string, string>();
   private nextId = 1;
   private fatalError?: Error;
   private buffer = "";
@@ -339,12 +465,21 @@ class CodexAppServerRpc {
   constructor(
     private readonly child: ChildProcessWithoutNullStreams,
     private readonly version?: string,
+    private readonly computerUse?: "windows",
   ) {
     createInterface({ input: child.stdout, crlfDelay: Infinity }).on("line", (line) => this.handleLine(line));
     child.stdin.on("error", (error) => this.fail(error));
     child.stderr.on("data", (chunk: Buffer) => {
       this.stderr = appendTail(this.stderr, chunk.toString("utf8"), MAX_STDERR_BYTES);
     });
+  }
+
+  setComputerUsePrompt(threadId: string, prompt: string): void {
+    this.computerUsePrompts.set(threadId, prompt);
+  }
+
+  clearComputerUsePrompt(threadId: string): void {
+    this.computerUsePrompts.delete(threadId);
   }
 
   request(method: string, params?: unknown): Promise<unknown> {
@@ -423,6 +558,19 @@ class CodexAppServerRpc {
       return;
     }
     if (id && method) {
+      if (method === "mcpServer/elicitation/request" && this.computerUse === "windows") {
+        const params = asRecord(message.params);
+        const threadId = directString(params?.threadId);
+        const prompt = threadId ? this.computerUsePrompts.get(threadId) : undefined;
+        const accepted = prompt ? shouldAcceptWindowsComputerUseElicitation(params, prompt) : false;
+        this.write({
+          id: message.id,
+          result: accepted
+            ? { action: "accept", content: {}, _meta: null }
+            : { action: "decline", content: null, _meta: null },
+        });
+        return;
+      }
       this.write({ id: message.id, error: { code: -32601, message: `Unsupported app-server request: ${method}` } });
       return;
     }
@@ -452,21 +600,21 @@ class CodexAppServerRpc {
   }
 }
 
-function threadParams(input: LocalAgentRunInput): Record<string, unknown> {
+function threadParams(input: LocalAgentRunInput, computerUse?: "windows"): Record<string, unknown> {
   return {
     ...(input.providerSessionId ? { threadId: input.providerSessionId } : {}),
     cwd: input.workspaceRoot,
-    approvalPolicy: "never",
+    approvalPolicy: computerUse === "windows" ? "on-request" : "never",
     sandbox: sandboxFor(input.writeMode),
     ...(input.model ? { model: input.model } : {}),
   };
 }
 
-function turnParams(input: LocalAgentRunInput, threadId: string): Record<string, unknown> {
+function turnParams(input: LocalAgentRunInput, threadId: string, computerUse?: "windows"): Record<string, unknown> {
   return {
     threadId,
     input: [{ type: "text", text: input.prompt }],
-    approvalPolicy: "never",
+    approvalPolicy: computerUse === "windows" ? "on-request" : "never",
     sandboxPolicy: sandboxPolicyFor(input.writeMode),
     ...(input.model ? { model: input.model } : {}),
     ...(input.effort ? { effort: input.effort } : {}),
@@ -537,6 +685,38 @@ function commandCandidates(command: string, env: NodeJS.ProcessEnv): string[] {
 
 function usesWindowsCommandShell(command: string): boolean {
   return process.platform === "win32" && /\.(?:cmd|bat)$/i.test(command);
+}
+
+export function shouldAcceptWindowsComputerUseElicitation(
+  params: Record<string, unknown> | undefined,
+  prompt: string,
+): boolean {
+  if (!params || directString(params.serverName) !== "node_repl") return false;
+  const request = asRecord(params.request) ?? params;
+  if (directString(request.mode) !== "form") return false;
+  const message = directString(request.message);
+  if (!message) return false;
+  const match = message.match(/^Allow Codex to use (.+?)\?$/);
+  const appName = match?.[1]?.trim();
+  if (!appName) return false;
+  const escapedAppName = appName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  if (/(?:不使用|不要使用|禁止使用|不得使用|不允许使用)\s*Computer\s+Use|(?:do not|don't|must not|never)\s+use\s+Computer\s+Use/i.test(prompt)) {
+    return false;
+  }
+  const negativeTarget = new RegExp(
+    `(?:不要|不得|禁止|不允许|不可|严禁)[^。！？\\n]{0,80}${escapedAppName}|(?:do not|don't|must not|never|forbid(?:den)?)[^.!?\\n]{0,80}${escapedAppName}`,
+    "i",
+  );
+  if (negativeTarget.test(prompt)) return false;
+  const explicitComputerUseTarget = new RegExp(
+    `Computer\\s+Use[^。！？\\n]{0,180}${escapedAppName}|${escapedAppName}[^。！？\\n]{0,180}Computer\\s+Use`,
+    "i",
+  );
+  if (!explicitComputerUseTarget.test(prompt)) return false;
+  const schema = asRecord(request.requestedSchema);
+  const required = schema?.required;
+  if (Array.isArray(required) && required.length > 0) return false;
+  return schema?.type === "object";
 }
 
 function turnMatchesEvent(turn: CodexTurnAccumulator, event: CodexEvent): boolean {

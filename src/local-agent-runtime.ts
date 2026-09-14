@@ -1,6 +1,6 @@
 import type { Result } from "better-result";
 import type { AgentProviderError } from "./local-agent-errors.js";
-import type { LocalAgentProvider } from "./local-agent-profiles.js";
+import type { LocalAgentComputerUse, LocalAgentProvider } from "./local-agent-profiles.js";
 
 export type LocalAgentWriteMode = "read_only" | "allowed" | "full_access";
 
@@ -39,6 +39,7 @@ export interface LocalAgentRuntimeContext {
   writeMode?: LocalAgentWriteMode;
   model?: string;
   effort?: string;
+  computerUse?: LocalAgentComputerUse;
   agentDir?: string;
 }
 
