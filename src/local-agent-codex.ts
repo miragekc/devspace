@@ -26,12 +26,12 @@ export interface ResolvedCodexCommand {
   executable: string;
   version?: string;
 }
+
 interface ResolvedWindowsComputerUseRuntime {
   executable: string;
   version?: string;
   nativePipe: string;
 }
-
 
 export type CodexCommandResolver = (env: NodeJS.ProcessEnv) => ResolvedCodexCommand | undefined;
 
@@ -80,6 +80,7 @@ export function parseCodexVersion(output: string | undefined): string | undefine
   const match = output?.trim().match(/v?(\d+\.\d+(?:\.\d+)?(?:[-+][0-9A-Za-z.-]+)?)/);
   return match?.[1];
 }
+
 export function resolveWindowsComputerUseRuntime(
   command: string,
   env: NodeJS.ProcessEnv = process.env,
@@ -133,7 +134,6 @@ async function canConnectNativePipe(nativePipe: string, timeoutMs = 1_000): Prom
     socket.setTimeout(timeoutMs, () => finish(false));
   });
 }
-
 
 export interface CodexAppServerRuntimeOptions {
   command: string;
@@ -473,6 +473,7 @@ class CodexAppServerRpc {
       this.stderr = appendTail(this.stderr, chunk.toString("utf8"), MAX_STDERR_BYTES);
     });
   }
+
   setComputerUsePrompt(threadId: string, prompt: string): void {
     this.computerUsePrompts.set(threadId, prompt);
   }
@@ -480,7 +481,6 @@ class CodexAppServerRpc {
   clearComputerUsePrompt(threadId: string): void {
     this.computerUsePrompts.delete(threadId);
   }
-
 
   request(method: string, params?: unknown): Promise<unknown> {
     if (this.fatalError) return Promise.reject(this.fatalError);
@@ -686,6 +686,7 @@ function commandCandidates(command: string, env: NodeJS.ProcessEnv): string[] {
 function usesWindowsCommandShell(command: string): boolean {
   return process.platform === "win32" && /\.(?:cmd|bat)$/i.test(command);
 }
+
 export function shouldAcceptWindowsComputerUseElicitation(
   params: Record<string, unknown> | undefined,
   prompt: string,
@@ -697,13 +698,26 @@ export function shouldAcceptWindowsComputerUseElicitation(
   if (!message) return false;
   const match = message.match(/^Allow Codex to use (.+?)\?$/);
   const appName = match?.[1]?.trim();
-  if (!appName || !prompt.includes(appName)) return false;
+  if (!appName) return false;
+  const escapedAppName = appName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  if (/(?:不使用|不要使用|禁止使用|不得使用|不允许使用)\s*Computer\s+Use|(?:do not|don't|must not|never)\s+use\s+Computer\s+Use/i.test(prompt)) {
+    return false;
+  }
+  const negativeTarget = new RegExp(
+    `(?:不要|不得|禁止|不允许|不可|严禁)[^。！？\\n]{0,80}${escapedAppName}|(?:do not|don't|must not|never|forbid(?:den)?)[^.!?\\n]{0,80}${escapedAppName}`,
+    "i",
+  );
+  if (negativeTarget.test(prompt)) return false;
+  const explicitComputerUseTarget = new RegExp(
+    `Computer\\s+Use[^。！？\\n]{0,180}${escapedAppName}|${escapedAppName}[^。！？\\n]{0,180}Computer\\s+Use`,
+    "i",
+  );
+  if (!explicitComputerUseTarget.test(prompt)) return false;
   const schema = asRecord(request.requestedSchema);
   const required = schema?.required;
   if (Array.isArray(required) && required.length > 0) return false;
   return schema?.type === "object";
 }
-
 
 function turnMatchesEvent(turn: CodexTurnAccumulator, event: CodexEvent): boolean {
   const params = asRecord(event.params);

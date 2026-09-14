@@ -72,6 +72,20 @@ try {
       "",
     ].join("\n"),
   );
+  await writeFile(
+    join(workspaceRoot, ".devspace", "agents", "invalid-windows.md"),
+    [
+      "---",
+      "name: invalid-windows",
+      "description: Invalid Windows Computer Use provider.",
+      "provider: claude",
+      "computer_use: windows",
+      "---",
+      "",
+      "Invalid body.",
+      "",
+    ].join("\n"),
+  );
 
   const enabledConfig = loadConfig(writeTestDevspaceConfig(configDir, {
     workspaces: { allowedRoots: [workspaceRoot] },

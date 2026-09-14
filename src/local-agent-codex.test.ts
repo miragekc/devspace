@@ -40,6 +40,22 @@ assert.equal(shouldAcceptWindowsComputerUseElicitation({
   },
 }, "使用 Computer Use，只读观察当前微信开发者工具窗口。"), false);
 assert.equal(shouldAcceptWindowsComputerUseElicitation({
+  serverName: "node_repl",
+  request: {
+    mode: "form",
+    message: "Allow Codex to use 任务管理器?",
+    requestedSchema: { type: "object", properties: {} },
+  },
+}, "使用 Computer Use，只观察微信开发者工具；禁止访问任务管理器。"), false);
+assert.equal(shouldAcceptWindowsComputerUseElicitation({
+  serverName: "node_repl",
+  request: {
+    mode: "form",
+    message: "Allow Codex to use 微信开发者工具?",
+    requestedSchema: { type: "object", properties: {} },
+  },
+}, "只读观察微信开发者工具窗口，不使用 Computer Use。"), false);
+assert.equal(shouldAcceptWindowsComputerUseElicitation({
   serverName: "other_mcp",
   request: {
     mode: "form",

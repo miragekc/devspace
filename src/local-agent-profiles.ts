@@ -15,8 +15,8 @@ export const LOCAL_AGENT_PROVIDERS: readonly LocalAgentProvider[] = [
   "copilot",
   "grok",
 ];
-export type LocalAgentComputerUse = "windows";
 
+export type LocalAgentComputerUse = "windows";
 
 export interface LocalAgentProfile {
   name: string;
@@ -161,8 +161,12 @@ function profileFromFrontmatter(
   const name = readString(frontmatter, "name") ?? basename(filePath, ".md");
   const description = readString(frontmatter, "description");
   const provider = readProvider(frontmatter, filePath);
+  const computerUse = readComputerUse(frontmatter, filePath);
   if (!description) {
     throw new Error(`Subagent profile is missing description: ${filePath}`);
+  }
+  if (computerUse && provider !== "codex") {
+    throw new Error(`Subagent profile computer_use requires provider codex: ${filePath}`);
   }
 
   return {
@@ -171,7 +175,7 @@ function profileFromFrontmatter(
     provider,
     model: readString(frontmatter, "model"),
     effort: readString(frontmatter, "effort"),
-    computerUse: readComputerUse(frontmatter, filePath),
+    computerUse,
     filePath,
     body,
     disabled: frontmatter.disabled === true,
@@ -194,6 +198,7 @@ function readProvider(frontmatter: Record<string, unknown>, filePath: string): L
 export function isLocalAgentProvider(value: string): value is LocalAgentProvider {
   return PROVIDERS.has(value as LocalAgentProvider);
 }
+
 function readComputerUse(
   frontmatter: Record<string, unknown>,
   filePath: string,
@@ -203,7 +208,6 @@ function readComputerUse(
   if (value === "windows") return value;
   throw new Error(`Subagent profile computer_use must be windows or false: ${filePath}`);
 }
-
 
 function readString(frontmatter: Record<string, unknown>, key: string): string | undefined {
   const value = frontmatter[key];
